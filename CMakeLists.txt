@@ -9,11 +9,34 @@ find_package(PkgConfig) # ${PKG_CONFIG_FOUND}
 pkg_search_module(GLIB2 REQUIRED glib-2.0)
 include_directories(${GLIB2_INCLUDE_DIRS})
 
-# wireshark
+# wireshark include dirs
 find_path(WIRESHARK_INCLUDE_DIRS epan/packet.h PATH_SUFFIXES wireshark)
 include_directories(${WIRESHARK_INCLUDE_DIRS})
 
-find_path(WIRESHARK_PLUGIN_DIRS gryphon.so PATH_SUFFIXES wireshark/plugins/1.10.1 wireshark/plugins wireshark PATHS /usr/lib /usr/local/lib)
+# abort when wireshark include dirs not found
+if(${WIRESHARK_INCLUDE_DIRS} STREQUAL "WIRESHARK_INCLUDE_DIRS-NOTFOUND")
+	message(FATAL_ERROR "wireshark include dirs not found")
+endif(${WIRESHARK_INCLUDE_DIRS} STREQUAL "WIRESHARK_INCLUDE_DIRS-NOTFOUND")
+
+# extract version
+file(READ ${WIRESHARK_INCLUDE_DIRS}/config.h WIRESHARK_CONFIG_H)
+string(REGEX MATCH "#define VERSION \"([^\"]+)\"" WIRESHARK_VERSION ${WIRESHARK_CONFIG_H})
+set(WIRESHARK_VERSION ${CMAKE_MATCH_1})
+
+# print wireshark include dir and version number
+message(STATUS "wireshark include dir: ${WIRESHARK_INCLUDE_DIRS}")
+message(STATUS "wireshark version: ${WIRESHARK_VERSION}")
+
+# wireshark plugin dirs
+find_path(WIRESHARK_PLUGIN_DIRS gryphon.so PATH_SUFFIXES wireshark/plugins/${WIRESHARK_VERSION} wireshark/plugins wireshark PATHS /usr/lib /usr/local/lib)
+
+# abort when wireshark plugin dirs not found
+if(${WIRESHARK_PLUGIN_DIRS} STREQUAL "WIRESHARK_PLUGIN_DIRS-NOTFOUND")
+	message(FATAL_ERROR "wireshark dissector plugin dirs not found")
+endif(${WIRESHARK_PLUGIN_DIRS} STREQUAL "WIRESHARK_PLUGIN_DIRS-NOTFOUND")
+
+#print wireshark plugin dirs
+message(STATUS "wireshark dissector plugin dir: ${WIRESHARK_PLUGIN_DIRS}")
 
 # Open Sound Control dissector plugin
 add_library(osc MODULE packet-osc.c)

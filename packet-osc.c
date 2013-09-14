@@ -380,10 +380,15 @@ plugin_reg_handoff(void)
 	
 	osc_handle = create_dissector_handle(dissect_osc, proto_osc);
 
-	dissector_add_uint("udp.port", 57110, osc_handle); // scsynth
-	dissector_add_uint("udp.port", 57120, osc_handle); // sclang
-	dissector_add_uint("udp.port", 3333, osc_handle); // tuio
+	// SuperCollider
+	dissector_add_uint("udp.port", 57110, osc_handle); // UDP scsynth
+	dissector_add_uint("tcp.port", 57110, osc_handle); // TCP scsynth
 
+	dissector_add_uint("udp.port", 57120, osc_handle); // UDP sclang
+	dissector_add_uint("tcp.port", 57120, osc_handle); // TCP sclang
+
+	// Chimaera
+	dissector_add_uint("udp.port", 3333, osc_handle); // tuio
 	dissector_add_uint("udp.port", 4444, osc_handle); // chimaera config
 	dissector_add_uint("udp.port", 6666, osc_handle); // chimaera debug
 }
