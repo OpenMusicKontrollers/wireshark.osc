@@ -349,7 +349,7 @@ plugin_register(void)
 			NULL, HFILL }
 		},
 		{ &hf_osc_message_midi_type, { "midi", "osc.message.midi",
-			FT_UINT32, BASE_HEX,
+			FT_BYTES, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
