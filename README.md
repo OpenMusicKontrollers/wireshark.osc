@@ -6,7 +6,7 @@ This is a wireshark dissector plugin for the Open Sound Control protocol.
 
 ### usage
 
-The plugin registers to listen automatically on UDP ports 3333(TUIO), 4444, 6666 and UDP/TCP ports 57110(scsynth), 57120(sclang). You may want to add additional ones at the end of "packet-osc.c" with "dissector\_add\_*".
+The plugin is written as a heuristic dissector, e.g. it will automatically recognize valid OSC packets on any non-assigned UDP and TCP port and bind future communication to the OSC protocol for the remaining session.
 
 ### build and install
 

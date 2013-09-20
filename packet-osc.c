@@ -23,11 +23,15 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <config.h>
 #include <epan/packet.h>
+#include <epan/conversation.h>
 
 gchar version [30] = "0.1";
+
+static dissector_handle_t osc_handle = NULL;
 
 static int proto_osc = -1;
 
@@ -238,6 +242,47 @@ dissect_osc(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree)
 	}
 }
 
+static gboolean
+dissect_osc_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+	gint offset = 0;
+	gint slen;
+	gint rem;
+	guint8 *str;
+
+	// read first string
+	str = tvb_get_ephemeral_stringz(tvb, offset, &slen);
+	if(strcmp(str, "#bundle") != 0) // no OSC bundle
+	{
+		// check whether it's a path
+		if(str[0] != '/')
+			return FALSE;
+
+		// skip path
+		if(rem = slen%4) slen += 4-rem;
+		offset += slen;
+
+		// read next string
+		str = tvb_get_ephemeral_stringz(tvb, offset, &slen);
+
+		// check whether it's a format
+		if(str[0] != ',')
+			return FALSE;
+	}
+
+	// if we get here, then it's an Open Sound Control packet (bundle or message)
+
+	// specify that dissect_osc is to be called directly from now on for packets for this connection
+	conversation_t *conversation = NULL;
+	conversation = find_or_create_conversation(pinfo);
+	conversation_set_dissector(conversation, osc_handle);
+
+	// do the dissection
+	dissect_osc(tvb, pinfo, tree);
+
+	return TRUE; // OSC heuristics was matched
+}
+
 void
 plugin_register(void)
 {
@@ -376,19 +421,9 @@ plugin_register(void)
 void
 plugin_reg_handoff(void)
 {
-	static dissector_handle_t osc_handle;
-	
 	osc_handle = create_dissector_handle(dissect_osc, proto_osc);
 
-	// SuperCollider
-	dissector_add_uint("udp.port", 57110, osc_handle); // UDP scsynth
-	dissector_add_uint("tcp.port", 57110, osc_handle); // TCP scsynth
-
-	dissector_add_uint("udp.port", 57120, osc_handle); // UDP sclang
-	dissector_add_uint("tcp.port", 57120, osc_handle); // TCP sclang
-
-	// Chimaera
-	dissector_add_uint("udp.port", 3333, osc_handle); // tuio
-	dissector_add_uint("udp.port", 4444, osc_handle); // chimaera config
-	dissector_add_uint("udp.port", 6666, osc_handle); // chimaera debug
+	// register as heuristic dissector for TCP and UDP connections
+	heur_dissector_add("tcp", dissect_osc_heur, proto_osc);
+	heur_dissector_add("udp", dissect_osc_heur, proto_osc);
 }
