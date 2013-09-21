@@ -29,7 +29,7 @@
 #include <epan/packet.h>
 #include <epan/conversation.h>
 
-gchar version [30] = "0.1";
+gchar version [30] = "0.2";
 
 static dissector_handle_t osc_handle = NULL;
 
@@ -37,15 +37,17 @@ static int proto_osc = -1;
 
 static int ett_osc_packet = -1;
 static int ett_osc_bundle = -1;
+static int ett_osc_bundle_element = -1;
 static int ett_osc_message = -1;
 static int ett_osc_blob = -1;
 
 static int hf_osc_bundle_type = -1;
+static int hf_osc_bundle_element_type = -1;
 static int hf_osc_message_type = -1;
 static int hf_osc_message_blob_type = -1;
 
 static int hf_osc_bundle_timetag_type = -1;
-static int hf_osc_bundle_size_type = -1;
+static int hf_osc_bundle_element_size_type = -1;
 
 static int hf_osc_message_path_type = -1;
 static int hf_osc_message_format_type = -1;
@@ -63,15 +65,19 @@ static int hf_osc_message_bang_type = -1;
 
 static int hf_osc_message_int64_type = -1;
 static int hf_osc_message_double_type = -1;
+static int hf_osc_message_timetag_type = -1;
 
 static int hf_osc_message_symbol_type = -1;
 static int hf_osc_message_char_type = -1;
+static int hf_osc_message_rgba_type = -1;
 static int hf_osc_message_midi_type = -1;
 
 static void
 dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint offset, gint len)
 {
 	proto_tree *message_tree = NULL;
+
+	// create message
 	ti = proto_tree_add_item(osc_tree, hf_osc_message_type, tvb, offset, len, ENC_BIG_ENDIAN);
 	message_tree = proto_item_add_subtree(ti, ett_osc_message);
 
@@ -79,21 +85,25 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
 	gint slen;
 	gint rem;
 
-	// read path
+	// peek/read path
 	guint8 *path = tvb_get_ephemeral_stringz(tvb, offset, &slen);
 	if(rem = slen%4) slen += 4-rem;
 	proto_tree_add_item(message_tree, hf_osc_message_path_type, tvb, offset, slen, ENC_ASCII);
 	offset += slen;
 
-	// read fmt
+	// TODO check for valid path
+
+	// peek/read fmt
 	guint8 *format = tvb_get_ephemeral_stringz(tvb, offset, &slen);
 	if(rem = slen%4) slen += 4-rem;
 	proto_tree_add_item(message_tree, hf_osc_message_format_type, tvb, offset, slen, ENC_ASCII);
 	offset += slen;
 
-	// ::read argument::
-	guint8 *ptr = format+1;
-	while(*ptr != '\0')
+	// TODO check for valid format
+
+	// ::parse argument::
+	guint8 *ptr = format+1; // skip ','
+	while( (*ptr != '\0') && (offset < end) )
 	{
 		switch(*ptr)
 		{
@@ -150,7 +160,7 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
 				offset += 8;
 				break;
 			case 't':
-				proto_tree_add_item(message_tree, hf_osc_bundle_timetag_type, tvb, offset, 8, ENC_BIG_ENDIAN);
+				proto_tree_add_item(message_tree, hf_osc_message_timetag_type, tvb, offset, 8, ENC_BIG_ENDIAN);
 				offset += 8;
 				break;
 
@@ -167,12 +177,27 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
 					proto_tree_add_item(message_tree, hf_osc_message_char_type, tvb, offset, 1, ENC_ASCII);
 					offset += 1;
 				break;
+			case 'r':
+					proto_tree_add_item(message_tree, hf_osc_message_rgba_type, tvb, offset, 4, ENC_BIG_ENDIAN);
+					offset += 4;
+				break;
 			case 'm':
 					proto_tree_add_item(message_tree, hf_osc_message_midi_type, tvb, offset, 4, ENC_ASCII);
 					offset += 4;
 				break;
+
+			case '[':
+				// TODO begin of array
+				break;
+			case ']':
+				// TODO end of array
+				break;
+
+			default:
+				// TODO we should never get here
+				break;
 		}
-		ptr += 1;
+		ptr++;
 	}
 }
 
@@ -180,8 +205,11 @@ static void
 dissect_osc_bundle(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint offset, gint len)
 {
 	proto_tree *bundle_tree = NULL;
+
+	// create bundle
 	ti = proto_tree_add_item(osc_tree, hf_osc_bundle_type, tvb, offset, len, ENC_BIG_ENDIAN);
 	bundle_tree = proto_item_add_subtree(ti, ett_osc_bundle);
+
 	gint end = offset + len;
 
 	// skip #bundle
@@ -194,17 +222,31 @@ dissect_osc_bundle(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint off
 	// ::read size, read block::
 	while(offset < end)
 	{
+		proto_tree *element_tree = NULL;
+
+		// peek bundle element size
 		gint32 size = tvb_get_ntohl(tvb, offset);
-		proto_tree_add_item(bundle_tree, hf_osc_bundle_size_type, tvb, offset, 4, ENC_BIG_ENDIAN);
+
+		// create bundle element
+		ti = proto_tree_add_item(bundle_tree, hf_osc_bundle_element_type, tvb, offset, size+4, ENC_BIG_ENDIAN);
+		element_tree = proto_item_add_subtree(ti, ett_osc_bundle_element);
+
+		// read bundle element size
+		proto_tree_add_item(element_tree, hf_osc_bundle_element_size_type, tvb, offset, 4, ENC_BIG_ENDIAN);
 		offset += 4;
+
+		// peek first bundle element char
 		guint8 ch = tvb_get_guint8(tvb, offset);
 		switch(ch)
 		{
-			case '#': // #bundle
-				dissect_osc_bundle(tvb, ti, bundle_tree, offset, size);
+			case '#': // this is a bundle
+				dissect_osc_bundle(tvb, ti, element_tree, offset, size);
 				break;
-			case '/': // message
-				dissect_osc_message(tvb, ti, bundle_tree, offset, size);
+			case '/': // this is a message
+				dissect_osc_message(tvb, ti, element_tree, offset, size);
+				break;
+			default:
+				// TODO we should never get here
 				break;
 		}
 		offset += size;
@@ -217,25 +259,27 @@ dissect_osc(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree)
 	gint offset = 0;
 
 	col_set_str(pinfo->cinfo, COL_PROTOCOL, "OSC");
-	/* Clear out stuff in the info column */
+	// clear out stuff in the info column
 	col_clear(pinfo->cinfo,COL_INFO);
 
-	if (tree) /* we are being asked for details */
+	if (tree) // we are being asked for details
 	{
 		proto_item *ti = NULL;
 		proto_tree *osc_tree = NULL;
 
+		// create OSC packet
 		ti = proto_tree_add_item(tree, proto_osc, tvb, 0, -1, ENC_NA);
 		osc_tree = proto_item_add_subtree(ti, ett_osc_packet);
 		int len = proto_item_get_len(ti);
 
+		// peek first bundle element char
 		guint8 ch = tvb_get_guint8(tvb, offset);
 		switch(ch)
 		{
-			case '#': // #bundle
+			case '#': // this is a bundle
 				dissect_osc_bundle(tvb, ti, osc_tree, offset, len);
 				break;
-			case '/': // message
+			case '/': // this is a message
 				dissect_osc_message(tvb, ti, osc_tree, offset, len);
 				break;
 		}
@@ -250,24 +294,28 @@ dissect_osc_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data
 	gint rem;
 	guint8 *str;
 
-	// read first string
+	// peek first string
 	str = tvb_get_ephemeral_stringz(tvb, offset, &slen);
 	if(strcmp(str, "#bundle") != 0) // no OSC bundle
 	{
 		// check whether it's a path
 		if(str[0] != '/')
-			return FALSE;
+			return FALSE; // OSC heuristics was NOT matched
+
+		// TODO check for valid path
 
 		// skip path
 		if(rem = slen%4) slen += 4-rem;
 		offset += slen;
 
-		// read next string
+		// peek next string
 		str = tvb_get_ephemeral_stringz(tvb, offset, &slen);
 
 		// check whether it's a format
 		if(str[0] != ',')
-			return FALSE;
+			return FALSE; // OSC heuristics was NOT matched
+
+		// TODO check for valid arguments
 	}
 
 	// if we get here, then it's an Open Sound Control packet (bundle or message)
@@ -292,51 +340,57 @@ plugin_register(void)
 			NULL, 0x0,
 			NULL, HFILL }
 		},
+		{ &hf_osc_bundle_timetag_type, { "timetag", "osc.bundle.timetag",
+			FT_UINT64, BASE_HEX,
+			NULL, 0x0,
+			NULL, HFILL }
+		},
+
+		{ &hf_osc_bundle_element_type, { "element", "osc.bundle.element",
+			FT_NONE, BASE_NONE,
+			NULL, 0x0,
+			NULL, HFILL }
+		},
+		{ &hf_osc_bundle_element_size_type, { "size", "osc.bundle.element.size",
+			FT_INT32, BASE_DEC,
+			NULL, 0x0,
+			NULL, HFILL }
+		},
+
 		{ &hf_osc_message_type, { "message", "osc.message",
 			FT_NONE, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_blob_type, { "blob", "osc.message.blob",
-			FT_NONE, BASE_NONE,
-			NULL, 0x0,
-			NULL, HFILL }
-		},
-
-		{ &hf_osc_bundle_timetag_type, { "timestamp", "osc.bundle.timestamp",
-			FT_UINT64, BASE_HEX,
-			NULL, 0x0,
-			NULL, HFILL }
-		},
-		{ &hf_osc_bundle_size_type, { "size", "osc.bundle.size",
-			FT_INT32, BASE_DEC,
-			NULL, 0x0,
-			NULL, HFILL }
-		},
-
-		{ &hf_osc_message_path_type, { "path", "osc.message.path",
+		{ &hf_osc_message_path_type, { "path   ", "osc.message.path",
 			FT_STRING, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_format_type, { "format", "osc.message.format",
+		{ &hf_osc_message_format_type, { "format ", "osc.message.format",
 			FT_STRING, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
 
-		{ &hf_osc_message_int32_type, { "int32", "osc.message.int32",
+		{ &hf_osc_message_int32_type, { "int32  ", "osc.message.int32",
 			FT_INT32, BASE_DEC,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_float_type, { "float", "osc.message.float",
+		{ &hf_osc_message_float_type, { "float  ", "osc.message.float",
 			FT_FLOAT, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_string_type, { "string", "osc.message.string",
+		{ &hf_osc_message_string_type, { "string ", "osc.message.string",
 			FT_STRING, BASE_NONE,
+			NULL, 0x0,
+			NULL, HFILL }
+		},
+
+		{ &hf_osc_message_blob_type, { "blob   ", "osc.message.blob",
+			FT_NONE, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
@@ -351,49 +405,59 @@ plugin_register(void)
 			NULL, HFILL }
 		},
 
-		{ &hf_osc_message_true_type, { "true", "osc.message.true",
+		{ &hf_osc_message_true_type, { "true   ", "osc.message.true",
 			FT_NONE, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_false_type, { "false", "osc.message.false",
+		{ &hf_osc_message_false_type, { "false  ", "osc.message.false",
 			FT_NONE, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_nil_type, { "nil", "osc.message.nil",
+		{ &hf_osc_message_nil_type, { "nil    ", "osc.message.nil",
 			FT_NONE, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_bang_type, { "bang", "osc.message.bang",
+		{ &hf_osc_message_bang_type, { "bang   ", "osc.message.bang",
 			FT_NONE, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
 
-		{ &hf_osc_message_int64_type, { "int64", "osc.message.int64",
+		{ &hf_osc_message_int64_type, { "int64  ", "osc.message.int64",
 			FT_INT64, BASE_DEC,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_double_type, { "double", "osc.message.double",
+		{ &hf_osc_message_double_type, { "double ", "osc.message.double",
 			FT_DOUBLE, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
+		{ &hf_osc_message_timetag_type, { "timetag", "osc.message.timetag",
+			FT_UINT64, BASE_HEX,
+			NULL, 0x0,
+			NULL, HFILL }
+		},
 
-		{ &hf_osc_message_symbol_type, { "symbol", "osc.message.symbol",
+		{ &hf_osc_message_symbol_type, { "symbol ", "osc.message.symbol",
 			FT_STRING, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_char_type, { "char", "osc.message.char",
+		{ &hf_osc_message_char_type, { "char   ", "osc.message.char",
 			FT_STRING, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
 		},
-		{ &hf_osc_message_midi_type, { "midi", "osc.message.midi",
+		{ &hf_osc_message_rgba_type, { "rgba   ", "osc.message.rgba",
+			FT_UINT32, BASE_HEX,
+			NULL, 0x0,
+			NULL, HFILL }
+		},
+		{ &hf_osc_message_midi_type, { "midi   ", "osc.message.midi",
 			FT_BYTES, BASE_NONE,
 			NULL, 0x0,
 			NULL, HFILL }
@@ -404,14 +468,15 @@ plugin_register(void)
 	static gint *ett[] = {
 		&ett_osc_packet,
 		&ett_osc_bundle,
+		&ett_osc_bundle_element,
 		&ett_osc_message,
 		&ett_osc_blob,
 	};
 
 	proto_osc = proto_register_protocol(
-		"Open Sound Control Protocol", /* name       */
-		"OSC",      /* short name */
-		"osc"       /* abbrev     */
+		"Open Sound Control Protocol",	// long name
+		"OSC",													// short name
+		"osc"														// abbreviation
 	);
 	
 	proto_register_field_array(proto_osc, hf, array_length(hf));
