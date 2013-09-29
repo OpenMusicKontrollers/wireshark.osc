@@ -133,6 +133,7 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
 				gint32 bloblen = tvb_get_ntohl(tvb, offset);
 				proto_tree_add_item(blob_tree, hf_osc_message_blob_size_type, tvb, offset, 4, ENC_BIG_ENDIAN);
 				offset += 4;
+				// TODO check for zero length
 				proto_tree_add_item(blob_tree, hf_osc_message_blob_data_type, tvb, offset, bloblen, ENC_BIG_ENDIAN);
 				offset += bloblen;
 				break;
@@ -226,6 +227,8 @@ dissect_osc_bundle(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint off
 
 		// peek bundle element size
 		gint32 size = tvb_get_ntohl(tvb, offset);
+
+		// TODO check for zero size
 
 		// create bundle element
 		ti = proto_tree_add_item(bundle_tree, hf_osc_bundle_element_type, tvb, offset, size+4, ENC_BIG_ENDIAN);
