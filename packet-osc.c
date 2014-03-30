@@ -1,8 +1,6 @@
 /* packet-osc.c
  * Routines for "Open Sound Control" packet dissection
- * Copyright 2014, Hanspeter Portner <dev@open-music-kontrollers.ch>
- *
- * $Id$
+ * Copyright 2014 Hanspeter Portner <dev@open-music-kontrollers.ch>
  *
  * Wireshark - Network traffic analyzer
  * By Gerald Combs <gerald@wireshark.org>
@@ -24,18 +22,24 @@
  */
 
 /*
- * Specification 1.0 (http://http://opensoundcontrol.org/spec-1_0)
+ * Specification 1.0 (http://opensoundcontrol.org/spec-1_0)
  * - based on default argument types: i,f,s,b
  * - including widely used extension types: T,F,N,I,h,d,t,S,c,r,m
  */
 
 #include "config.h"
 
-#include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #include <epan/packet.h>
+#include <epan/prefs.h>
 #include <epan/conversation.h>
+#include <epan/exceptions.h>
+//#include "packet-tcp.h"
+
+void proto_register_osc(void);
+void proto_reg_handoff_osc(void);
 
 /* Open Sound Control (OSC) argument types enumeration */
 typedef enum _OSC_Type {
@@ -61,232 +65,135 @@ typedef enum _OSC_Type {
 
 /* characters not allowed in OSC path string */
 static const char invalid_path_chars [] = {
-    ' ', '#', '*', ',', '?', '[', ']', '{', '}',
+    ' ', '#',
     '\0'
 };
 
 /* allowed characters in OSC format string */
 static const char valid_format_chars [] = {
-    OSC_INT32, OSC_FLOAT, OSC_STRING, OSC_BLOB,
-    OSC_TRUE, OSC_FALSE, OSC_NIL, OSC_BANG,
-    OSC_INT64, OSC_DOUBLE, OSC_TIMETAG,
-    OSC_SYMBOL, OSC_CHAR, OSC_MIDI,
+    OSC_INT32,  OSC_FLOAT,  OSC_STRING,  OSC_BLOB,
+    OSC_TRUE,   OSC_FALSE,  OSC_NIL,     OSC_BANG,
+    OSC_INT64,  OSC_DOUBLE, OSC_TIMETAG,
+    OSC_SYMBOL, OSC_CHAR,   OSC_RGBA,    OSC_MIDI,
     '\0'
 };
 
+#define MIDI_STATUS_CONTROLLER 0xB0
+
 /* Standard MIDI Message Type */
-typedef enum _MIDI_Status {
-    MIDI_MSG_INVALID          = 0x00,
-    MIDI_MSG_NOTE_OFF         = 0x80,
-    MIDI_MSG_NOTE_ON          = 0x90,
-    MIDI_MSG_NOTE_PRESSURE    = 0xA0,
-    MIDI_MSG_CONTROLLER       = 0xB0,
-    MIDI_MSG_PGM_CHANGE       = 0xC0,
-    MIDI_MSG_CHANNEL_PRESSURE = 0xD0,
-    MIDI_MSG_BENDER           = 0xE0,
-    MIDI_MSG_SYSTEM_EXCLUSIVE = 0xF0,
-    MIDI_MSG_MTC_QUARTER      = 0xF1,
-    MIDI_MSG_SONG_POS         = 0xF2,
-    MIDI_MSG_SONG_SELECT      = 0xF3,
-    MIDI_MSG_TUNE_REQUEST     = 0xF6,
-    MIDI_MSG_CLOCK            = 0xF8,
-    MIDI_MSG_START            = 0xFA,
-    MIDI_MSG_CONTINUE         = 0xFB,
-    MIDI_MSG_STOP             = 0xFC,
-    MIDI_MSG_ACTIVE_SENSE     = 0xFE,
-    MIDI_MSG_RESET            = 0xFF 
-} MIDI_Status;
+static const value_string MIDI_status [] = {
+    { 0x00, "Invalid Message" },
+    { 0x80, "Note Off" },
+    { 0x90, "Note On" },
+    { 0xA0, "Note Pressure" },
+    { MIDI_STATUS_CONTROLLER, "Controller" },
+    { 0xC0, "Program Change" },
+    { 0xD0, "Channel Pressure" },
+    { 0xE0, "Pitch Bender" },
+    { 0xF0, "System Exclusive Begin" },
+    { 0xF1, "MTC Quarter Frame" },
+    { 0xF2, "Song Position" },
+    { 0xF3, "Song Select" },
+    { 0xF6, "Tune Request" },
+    { 0xF8, "Clock" },
+    { 0xFA, "Start" },
+    { 0xFB, "Continue" },
+    { 0xFC, "Stop" },
+    { 0xFE, "Active Sensing" },
+    { 0xFF, "Reset" },
+
+    {0, NULL }
+};
+static value_string_ext MIDI_status_ext = VALUE_STRING_EXT_INIT(MIDI_status);
 
 /* Standard MIDI Controller Numbers */
-typedef enum _MIDI_Control {
-    MIDI_CTL_MSB_BANK             = 0x00,
-    MIDI_CTL_MSB_MODWHEEL         = 0x01,
-    MIDI_CTL_MSB_BREATH           = 0x02,
-    MIDI_CTL_MSB_FOOT             = 0x04,
-    MIDI_CTL_MSB_PORTAMENTO_TIME  = 0x05,
-    MIDI_CTL_MSB_DATA_ENTRY       = 0x06,
-    MIDI_CTL_MSB_MAIN_VOLUME      = 0x07,
-    MIDI_CTL_MSB_BALANCE          = 0x08,
-    MIDI_CTL_MSB_PAN              = 0x0A,
-    MIDI_CTL_MSB_EXPRESSION       = 0x0B,
-    MIDI_CTL_MSB_EFFECT1          = 0x0C,
-    MIDI_CTL_MSB_EFFECT2          = 0x0D,
-    MIDI_CTL_MSB_GENERAL_PURPOSE1 = 0x10,
-    MIDI_CTL_MSB_GENERAL_PURPOSE2 = 0x11,
-    MIDI_CTL_MSB_GENERAL_PURPOSE3 = 0x12,
-    MIDI_CTL_MSB_GENERAL_PURPOSE4 = 0x13,
-    MIDI_CTL_LSB_BANK             = 0x20,
-    MIDI_CTL_LSB_MODWHEEL         = 0x21,
-    MIDI_CTL_LSB_BREATH           = 0x22,
-    MIDI_CTL_LSB_FOOT             = 0x24,
-    MIDI_CTL_LSB_PORTAMENTO_TIME  = 0x25,
-    MIDI_CTL_LSB_DATA_ENTRY       = 0x26,
-    MIDI_CTL_LSB_MAIN_VOLUME      = 0x27,
-    MIDI_CTL_LSB_BALANCE          = 0x28,
-    MIDI_CTL_LSB_PAN              = 0x2A,
-    MIDI_CTL_LSB_EXPRESSION       = 0x2B,
-    MIDI_CTL_LSB_EFFECT1          = 0x2C,
-    MIDI_CTL_LSB_EFFECT2          = 0x2D,
-    MIDI_CTL_LSB_GENERAL_PURPOSE1 = 0x30,
-    MIDI_CTL_LSB_GENERAL_PURPOSE2 = 0x31,
-    MIDI_CTL_LSB_GENERAL_PURPOSE3 = 0x32,
-    MIDI_CTL_LSB_GENERAL_PURPOSE4 = 0x33,
-    MIDI_CTL_SUSTAIN              = 0x40,
-    MIDI_CTL_PORTAMENTO           = 0x41,
-    MIDI_CTL_SOSTENUTO            = 0x42,
-    MIDI_CTL_SOFT_PEDAL           = 0x43,
-    MIDI_CTL_LEGATO_FOOTSWITCH    = 0x44,
-    MIDI_CTL_HOLD2                = 0x45,
-    MIDI_CTL_SC1_SOUND_VARIATION  = 0x46,
-    MIDI_CTL_SC2_TIMBRE           = 0x47,
-    MIDI_CTL_SC3_RELEASE_TIME     = 0x48,
-    MIDI_CTL_SC4_ATTACK_TIME      = 0x49,
-    MIDI_CTL_SC5_BRIGHTNESS       = 0x4A,
-    MIDI_CTL_SC6                  = 0x4B,
-    MIDI_CTL_SC7                  = 0x4C,
-    MIDI_CTL_SC8                  = 0x4D,
-    MIDI_CTL_SC9                  = 0x4E,
-    MIDI_CTL_SC10                 = 0x4F,
-    MIDI_CTL_GENERAL_PURPOSE5     = 0x50,
-    MIDI_CTL_GENERAL_PURPOSE6     = 0x51,
-    MIDI_CTL_GENERAL_PURPOSE7     = 0x52,
-    MIDI_CTL_GENERAL_PURPOSE8     = 0x53,
-    MIDI_CTL_PORTAMENTO_CONTROL   = 0x54,
-    MIDI_CTL_E1_REVERB_DEPTH      = 0x5B,
-    MIDI_CTL_E2_TREMOLO_DEPTH     = 0x5C,
-    MIDI_CTL_E3_CHORUS_DEPTH      = 0x5D,
-    MIDI_CTL_E4_DETUNE_DEPTH      = 0x5E,
-    MIDI_CTL_E5_PHASER_DEPTH      = 0x5F,
-    MIDI_CTL_DATA_INCREMENT       = 0x60,
-    MIDI_CTL_DATA_DECREMENT       = 0x61,
-    MIDI_CTL_NRPN_LSB             = 0x62,
-    MIDI_CTL_NRPN_MSB             = 0x63,
-    MIDI_CTL_RPN_LSB              = 0x64,
-    MIDI_CTL_RPN_MSB              = 0x65,
-    MIDI_CTL_ALL_SOUNDS_OFF       = 0x78,
-    MIDI_CTL_RESET_CONTROLLERS    = 0x79,
-    MIDI_CTL_LOCAL_CONTROL_SWITCH = 0x7A,
-    MIDI_CTL_ALL_NOTES_OFF        = 0x7B,
-    MIDI_CTL_OMNI_OFF             = 0x7C,
-    MIDI_CTL_OMNI_ON              = 0x7D,
-    MIDI_CTL_MONO1                = 0x7E,
-    MIDI_CTL_MONO2                = 0x7F 
-} MIDI_Control;
+static const value_string MIDI_control [] = {
+    { 0x00, "Bank Selection" },
+    { 0x01, "Modulation" },
+    { 0x02, "Breath" },
+    { 0x04, "Foot" },
+    { 0x05, "Portamento Time" },
+    { 0x06, "Data Entry" },
+    { 0x07, "Main Volume" },
+    { 0x08, "Balance" },
+    { 0x0A, "Panpot" },
+    { 0x0B, "Expression" },
+    { 0x0C, "Effect1" },
+    { 0x0D, "Effect2" },
+    { 0x10, "General Purpose 1" },
+    { 0x11, "General Purpose 2" },
+    { 0x12, "General Purpose 3" },
+    { 0x13, "General Purpose 4" },
+    { 0x20, "Bank Selection" },
+    { 0x21, "Modulation" },
+    { 0x22, "Breath" },
+    { 0x24, "Foot" },
+    { 0x25, "Portamento Time" },
+    { 0x26, "Data Entry" },
+    { 0x27, "Main Volume" },
+    { 0x28, "Balance" },
+    { 0x2A, "Panpot" },
+    { 0x2B, "Expression" },
+    { 0x2C, "Effect1" },
+    { 0x2D, "Effect2" },
+    { 0x30, "General Purpose 1" },
+    { 0x31, "General Purpose 2" },
+    { 0x32, "General Purpose 3" },
+    { 0x33, "General Purpose 4" },
+    { 0x40, "Sustain Pedal" },
+    { 0x41, "Portamento" },
+    { 0x42, "Sostenuto" },
+    { 0x43, "Soft Pedal" },
+    { 0x44, "Legato Foot Switch" },
+    { 0x45, "Hold2" },
+    { 0x46, "SC1 Sound Variation" },
+    { 0x47, "SC2 Timbre" },
+    { 0x48, "SC3 Release Time" },
+    { 0x49, "SC4 Attack Time" },
+    { 0x4A, "SC5 Brightness" },
+    { 0x4B, "SC6" },
+    { 0x4C, "SC7" },
+    { 0x4D, "SC8" },
+    { 0x4E, "SC9" },
+    { 0x4F, "SC10" },
+    { 0x50, "General Purpose 5" },
+    { 0x51, "General Purpose 6" },
+    { 0x52, "General Purpose 7" },
+    { 0x53, "General Purpose 8" },
+    { 0x54, "Portamento Control" },
+    { 0x5B, "E1 Reverb Depth" },
+    { 0x5C, "E2 Tremolo Depth" },
+    { 0x5D, "E3 Chorus Depth" },
+    { 0x5E, "E4 Detune Depth" },
+    { 0x5F, "E5 Phaser Depth" },
+    { 0x60, "Data Increment" },
+    { 0x61, "Data Decrement" },
+    { 0x62, "Non-registered Parameter Number" },
+    { 0x63, "Non-registered Parameter Number" },
+    { 0x64, "Registered Parameter Number" },
+    { 0x65, "Registered Parameter Number" },
+    { 0x78, "All Sounds Off" },
+    { 0x79, "Reset Controllers" },
+    { 0x7A, "Local Control Switch" },
+    { 0x7B, "All Notes Off" },
+    { 0x7C, "Omni Off" },
+    { 0x7D, "Omni On" },
+    { 0x7E, "Mono1" },
+    { 0x7F, "Mono2" },
 
-typedef struct _MIDI_Status_Dict {
-    MIDI_Status status;
-    const char *id;
-} MIDI_Status_Dict;
-
-typedef struct _MIDI_Control_Dict {
-    MIDI_Control control;
-    const char *id;
-} MIDI_Control_Dict;
-
-static const MIDI_Status_Dict midi_status_dict [] = {
-    {MIDI_MSG_INVALID          , "Invalid Message"},
-    {MIDI_MSG_NOTE_OFF         , "Note Off"},
-    {MIDI_MSG_NOTE_ON          , "Note On"},
-    {MIDI_MSG_NOTE_PRESSURE    , "Note Pressure"},
-    {MIDI_MSG_CONTROLLER       , "Controller"},
-    {MIDI_MSG_PGM_CHANGE       , "Program Change"},
-    {MIDI_MSG_CHANNEL_PRESSURE , "Channel Pressure"},
-    {MIDI_MSG_BENDER           , "Pitch Bender"},
-    {MIDI_MSG_SYSTEM_EXCLUSIVE , "System Exclusive Begin"},
-    {MIDI_MSG_MTC_QUARTER      , "MTC Quarter Frame"},
-    {MIDI_MSG_SONG_POS         , "Song Position"},
-    {MIDI_MSG_SONG_SELECT      , "Song Select"},
-    {MIDI_MSG_TUNE_REQUEST     , "Tune Request"},
-    {MIDI_MSG_CLOCK            , "Clock"},
-    {MIDI_MSG_START            , "Start"},
-    {MIDI_MSG_CONTINUE         , "Continue"},
-    {MIDI_MSG_STOP             , "Stop"},
-    {MIDI_MSG_ACTIVE_SENSE     , "Active Sensing"},
-    {MIDI_MSG_RESET            , "Reset"},
-    {0, NULL}
+    { 0, NULL }
 };
+static value_string_ext MIDI_control_ext = VALUE_STRING_EXT_INIT(MIDI_control);
 
-static const MIDI_Control_Dict midi_control_dict [] = {
-    {MIDI_CTL_MSB_BANK             , "Bank Selection"},
-    {MIDI_CTL_MSB_MODWHEEL         , "Modulation"},
-    {MIDI_CTL_MSB_BREATH           , "Breath"},
-    {MIDI_CTL_MSB_FOOT             , "Foot"},
-    {MIDI_CTL_MSB_PORTAMENTO_TIME  , "Portamento Time"},
-    {MIDI_CTL_MSB_DATA_ENTRY       , "Data Entry"},
-    {MIDI_CTL_MSB_MAIN_VOLUME      , "Main Volume"},
-    {MIDI_CTL_MSB_BALANCE          , "Balance"},
-    {MIDI_CTL_MSB_PAN              , "Panpot"},
-    {MIDI_CTL_MSB_EXPRESSION       , "Expression"},
-    {MIDI_CTL_MSB_EFFECT1          , "Effect1"},
-    {MIDI_CTL_MSB_EFFECT2          , "Effect2"},
-    {MIDI_CTL_MSB_GENERAL_PURPOSE1 , "General Purpose 1"},
-    {MIDI_CTL_MSB_GENERAL_PURPOSE2 , "General Purpose 2"},
-    {MIDI_CTL_MSB_GENERAL_PURPOSE3 , "General Purpose 3"},
-    {MIDI_CTL_MSB_GENERAL_PURPOSE4 , "General Purpose 4"},
-    {MIDI_CTL_LSB_BANK             , "Bank Selection"},
-    {MIDI_CTL_LSB_MODWHEEL         , "Modulation"},
-    {MIDI_CTL_LSB_BREATH           , "Breath"},
-    {MIDI_CTL_LSB_FOOT             , "Foot"},
-    {MIDI_CTL_LSB_PORTAMENTO_TIME  , "Portamento Time"},
-    {MIDI_CTL_LSB_DATA_ENTRY       , "Data Entry"},
-    {MIDI_CTL_LSB_MAIN_VOLUME      , "Main Volume"},
-    {MIDI_CTL_LSB_BALANCE          , "Balance"},
-    {MIDI_CTL_LSB_PAN              , "Panpot"},
-    {MIDI_CTL_LSB_EXPRESSION       , "Expression"},
-    {MIDI_CTL_LSB_EFFECT1          , "Effect1"},
-    {MIDI_CTL_LSB_EFFECT2          , "Effect2"},
-    {MIDI_CTL_LSB_GENERAL_PURPOSE1 , "General Purpose 1"},
-    {MIDI_CTL_LSB_GENERAL_PURPOSE2 , "General Purpose 2"},
-    {MIDI_CTL_LSB_GENERAL_PURPOSE3 , "General Purpose 3"},
-    {MIDI_CTL_LSB_GENERAL_PURPOSE4 , "General Purpose 4"},
-    {MIDI_CTL_SUSTAIN              , "Sustain Pedal"},
-    {MIDI_CTL_PORTAMENTO           , "Portamento"},
-    {MIDI_CTL_SOSTENUTO            , "Sostenuto"},
-    {MIDI_CTL_SOFT_PEDAL           , "Soft Pedal"},
-    {MIDI_CTL_LEGATO_FOOTSWITCH    , "Legato Foot Switch"},
-    {MIDI_CTL_HOLD2                , "Hold2"},
-    {MIDI_CTL_SC1_SOUND_VARIATION  , "SC1 Sound Variation"},
-    {MIDI_CTL_SC2_TIMBRE           , "SC2 Timbre"},
-    {MIDI_CTL_SC3_RELEASE_TIME     , "SC3 Release Time"},
-    {MIDI_CTL_SC4_ATTACK_TIME      , "SC4 Attack Time"},
-    {MIDI_CTL_SC5_BRIGHTNESS       , "SC5 Brightness"},
-    {MIDI_CTL_SC6                  , "SC6"},
-    {MIDI_CTL_SC7                  , "SC7"},
-    {MIDI_CTL_SC8                  , "SC8"},
-    {MIDI_CTL_SC9                  , "SC9"},
-    {MIDI_CTL_SC10                 , "SC10"},
-    {MIDI_CTL_GENERAL_PURPOSE5     , "General Purpose 5"},
-    {MIDI_CTL_GENERAL_PURPOSE6     , "General Purpose 6"},
-    {MIDI_CTL_GENERAL_PURPOSE7     , "General Purpose 7"},
-    {MIDI_CTL_GENERAL_PURPOSE8     , "General Purpose 8"},
-    {MIDI_CTL_PORTAMENTO_CONTROL   , "Portamento Control"},
-    {MIDI_CTL_E1_REVERB_DEPTH      , "E1 Reverb Depth"},
-    {MIDI_CTL_E2_TREMOLO_DEPTH     , "E2 Tremolo Depth"},
-    {MIDI_CTL_E3_CHORUS_DEPTH      , "E3 Chorus Depth"},
-    {MIDI_CTL_E4_DETUNE_DEPTH      , "E4 Detune Depth"},
-    {MIDI_CTL_E5_PHASER_DEPTH      , "E5 Phaser Depth"},
-    {MIDI_CTL_DATA_INCREMENT       , "Data Increment"},
-    {MIDI_CTL_DATA_DECREMENT       , "Data Decrement"},
-    {MIDI_CTL_NRPN_LSB             , "Non-registered Parameter Number"},
-    {MIDI_CTL_NRPN_MSB             , "Non-registered Parameter Number"},
-    {MIDI_CTL_RPN_LSB              , "Registered Parameter Number"},
-    {MIDI_CTL_RPN_MSB              , "Registered Parameter Number"},
-    {MIDI_CTL_ALL_SOUNDS_OFF       , "All Sounds Off"},
-    {MIDI_CTL_RESET_CONTROLLERS    , "Reset Controllers"},
-    {MIDI_CTL_LOCAL_CONTROL_SWITCH , "Local Control Switch"},
-    {MIDI_CTL_ALL_NOTES_OFF        , "All Notes Off"},
-    {MIDI_CTL_OMNI_OFF             , "Omni Off"},
-    {MIDI_CTL_OMNI_ON              , "Omni On"},
-    {MIDI_CTL_MONO1                , "Mono1"},
-    {MIDI_CTL_MONO2                , "Mono2"},
-    {0, NULL}
-};
-
+static const char *immediate_fmt = "%s";
 static const char *immediate_str = "Immediate";
 static const char *bundle_str = "#bundle";
 
+/* Preference */
+static guint global_osc_tcp_port = 0;
+
 /* Initialize the protocol and registered fields */
-static dissector_handle_t osc_handle = NULL;
+static dissector_handle_t osc_udp_handle = NULL;
 
 static int proto_osc = -1;
 
@@ -330,6 +237,8 @@ static int hf_osc_message_midi_channel_type = -1;
 static int hf_osc_message_midi_status_type = -1;
 static int hf_osc_message_midi_data1_type = -1;
 static int hf_osc_message_midi_data2_type = -1;
+static int hf_osc_message_midi_controller_type = -1;
+static int hf_osc_message_midi_value_type = -1;
 
 /* Initialize the subtree pointers */
 static int ett_osc_packet = -1;
@@ -341,47 +250,47 @@ static int ett_osc_rgba = -1;
 static int ett_osc_midi = -1;
 
 /* check for valid path string */
-static int
+static gboolean
 is_valid_path(const char *path)
 {
     const char *ptr;
     if(path[0] != '/')
-        return 0;
-    for(ptr=invalid_path_chars; *ptr!='\0'; ptr++)
-        if(strchr(path+1, *ptr) != NULL)
-            return 0;
-    return 1;
+        return FALSE;
+    for(ptr=path+1; *ptr!='\0'; ptr++)
+        if( (isprint(*ptr) == 0) || (strchr(invalid_path_chars, *ptr) != NULL) )
+            return FALSE;
+    return TRUE;
 }
 
 /* check for valid format string */
-static int
+static gboolean
 is_valid_format(const char *format)
 {
     const char *ptr;
     if(format[0] != ',')
-        return 0;
+        return FALSE;
     for(ptr=format+1; *ptr!='\0'; ptr++)
         if(strchr(valid_format_chars, *ptr) == NULL)
-            return 0;
-    return 1;
+            return FALSE;
+    return TRUE;
 }
 
 /* Dissect OSC message */
 static int
 dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint offset, gint len)
 {
-    proto_tree *message_tree = NULL;
-    proto_tree *header_tree = NULL;
-    gint slen;
-    gint rem;
-    gint end = offset + len;
-    const gchar *path = NULL;
-    gint path_len;
-    gint path_offset;
-    const gchar *format = NULL;
-    gint format_offset;
-    gint format_len;
-    const gchar *ptr = NULL;
+    proto_tree  *message_tree;
+    proto_tree  *header_tree;
+    gint         slen;
+    gint         rem;
+    gint         end = offset + len;
+    const gchar *path;
+    gint         path_len;
+    gint         path_offset;
+    const gchar *format;
+    gint         format_offset;
+    gint         format_len;
+    const gchar *ptr;
 
     /* peek/read path */
     path_offset = offset;
@@ -404,14 +313,14 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
     message_tree = proto_item_add_subtree(ti, ett_osc_message);
 
     /* append header */
-    ti = proto_tree_add_item(message_tree, hf_osc_message_header_type, tvb, offset, path_len+format_len, ENC_BIG_ENDIAN);
+    ti = proto_tree_add_item(message_tree, hf_osc_message_header_type, tvb, offset, path_len+format_len, ENC_NA);
     header_tree = proto_item_add_subtree(ti, ett_osc_message_header);
 
     /* append path */
-    proto_tree_add_item(header_tree, hf_osc_message_path_type, tvb, path_offset, path_len, ENC_ASCII);
+    proto_tree_add_item(header_tree, hf_osc_message_path_type, tvb, path_offset, path_len, ENC_ASCII | ENC_NA);
 
     /* append format */
-    proto_tree_add_item(header_tree, hf_osc_message_format_type, tvb, format_offset, format_len, ENC_ASCII);
+    proto_tree_add_item(header_tree, hf_osc_message_format_type, tvb, format_offset, format_len, ENC_ASCII | ENC_NA);
 
     offset += path_len + format_len;
 
@@ -432,19 +341,19 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
             case OSC_STRING:
                 slen = tvb_strsize(tvb, offset);
                 if( (rem = slen%4) ) slen += 4-rem;
-                proto_tree_add_item(message_tree, hf_osc_message_string_type, tvb, offset, slen, ENC_ASCII);
+                proto_tree_add_item(message_tree, hf_osc_message_string_type, tvb, offset, slen, ENC_ASCII | ENC_NA);
                 offset += slen;
                 break;
             case OSC_BLOB:
             {
-                proto_item *bi = NULL;
-                proto_tree *blob_tree = NULL;
+                proto_item *bi;
+                proto_tree *blob_tree;
 
                 gint32 blen = tvb_get_ntohl(tvb, offset);
                 slen = blen;
                 if( (rem = slen%4) ) slen += 4-rem;
-                
-                bi = proto_tree_add_none_format(message_tree, hf_osc_message_blob_type, tvb, offset, 4+slen, "Blob   : %i bytes", blen);
+
+                bi = proto_tree_add_none_format(message_tree, hf_osc_message_blob_type, tvb, offset, 4+slen, "Blob: %i bytes", blen);
                 blob_tree = proto_item_add_subtree(bi, ett_osc_blob);
 
                 proto_tree_add_int_format_value(blob_tree, hf_osc_message_blob_size_type, tvb, offset, 4, blen, "%i bytes", blen);
@@ -454,22 +363,22 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
                 if(blen == 0)
                     break;
 
-                proto_tree_add_item(blob_tree, hf_osc_message_blob_data_type, tvb, offset, slen, ENC_BIG_ENDIAN);
+                proto_tree_add_item(blob_tree, hf_osc_message_blob_data_type, tvb, offset, slen, ENC_NA);
                 offset += slen;
                 break;
             }
 
             case OSC_TRUE:
-                proto_tree_add_item(message_tree, hf_osc_message_true_type, tvb, offset, 0, ENC_BIG_ENDIAN);
+                proto_tree_add_item(message_tree, hf_osc_message_true_type, tvb, offset, 0, ENC_NA);
                 break;
             case OSC_FALSE:
-                proto_tree_add_item(message_tree, hf_osc_message_false_type, tvb, offset, 0, ENC_BIG_ENDIAN);
+                proto_tree_add_item(message_tree, hf_osc_message_false_type, tvb, offset, 0, ENC_NA);
                 break;
             case OSC_NIL:
-                proto_tree_add_item(message_tree, hf_osc_message_nil_type, tvb, offset, 0, ENC_BIG_ENDIAN);
+                proto_tree_add_item(message_tree, hf_osc_message_nil_type, tvb, offset, 0, ENC_NA);
                 break;
             case OSC_BANG:
-                proto_tree_add_item(message_tree, hf_osc_message_bang_type, tvb, offset, 0, ENC_BIG_ENDIAN);
+                proto_tree_add_item(message_tree, hf_osc_message_bang_type, tvb, offset, 0, ENC_NA);
                 break;
 
             case OSC_INT64:
@@ -482,11 +391,11 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
                 break;
             case OSC_TIMETAG:
             {
-                guint32 sec = tvb_get_ntohl(tvb, offset);
-                guint32 frac = tvb_get_ntohl(tvb, offset+4);
+                guint32  sec  = tvb_get_ntohl(tvb, offset);
+                guint32  frac = tvb_get_ntohl(tvb, offset+4);
                 nstime_t ns;
-                if( (sec == 0UL) && (frac == 1UL) )
-                    proto_tree_add_time_format_value(message_tree, hf_osc_message_timetag_type, tvb, offset, 8, &ns, immediate_str);
+                if( (sec == 0) && (frac == 1) )
+                    proto_tree_add_time_format_value(message_tree, hf_osc_message_timetag_type, tvb, offset, 8, &ns, immediate_fmt, immediate_str);
                 else
                     proto_tree_add_item(message_tree, hf_osc_message_timetag_type, tvb, offset, 8, ENC_TIME_NTP | ENC_BIG_ENDIAN);
                 offset += 8;
@@ -496,18 +405,18 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
             case OSC_SYMBOL:
                 slen = tvb_strsize(tvb, offset);
                 if( (rem = slen%4) ) slen += 4-rem;
-                proto_tree_add_item(message_tree, hf_osc_message_symbol_type, tvb, offset, slen, ENC_ASCII);
+                proto_tree_add_item(message_tree, hf_osc_message_symbol_type, tvb, offset, slen, ENC_ASCII | ENC_NA);
                 offset += slen;
                 break;
             case OSC_CHAR:
                 offset += 3;
-                proto_tree_add_item(message_tree, hf_osc_message_char_type, tvb, offset, 1, ENC_ASCII);
+                proto_tree_add_item(message_tree, hf_osc_message_char_type, tvb, offset, 1, ENC_ASCII | ENC_NA);
                 offset += 1;
                 break;
             case OSC_RGBA:
             {
-                proto_item *ri = NULL;
-                proto_tree *rgba_tree = NULL;
+                proto_item *ri;
+                proto_tree *rgba_tree;
 
                 ri = proto_tree_add_item(message_tree, hf_osc_message_rgba_type, tvb, offset, 4, ENC_BIG_ENDIAN);
                 rgba_tree = proto_item_add_subtree(ri, ett_osc_rgba);
@@ -524,68 +433,72 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
             }
             case OSC_MIDI:
             {
-                const MIDI_Status_Dict *sd = NULL;
-                const MIDI_Control_Dict *cd = NULL;
-                proto_item *mi = NULL;
-                proto_tree *midi_tree = NULL;
-                guint8 channel;
-                guint8 status;
-                guint8 data1;
-                guint8 data2;
-                
-                channel = tvb_get_guint8(tvb, offset);
-                status = tvb_get_guint8(tvb, offset+1);
-                data1 = tvb_get_guint8(tvb, offset+2);
-                data2 = tvb_get_guint8(tvb, offset+3);
+                const gchar *status_str;
+                proto_item  *mi = NULL;
+                proto_tree  *midi_tree;
+                guint8       channel;
+                guint8       status;
+                guint8       data1;
+                guint8       data2;
 
-                for(sd = midi_status_dict; sd->id != NULL; sd++)
-                    if(sd->status == status)
-                        break;
-                        
-                if(status == MIDI_MSG_CONTROLLER)
+                channel = tvb_get_guint8(tvb, offset);
+                status  = tvb_get_guint8(tvb, offset+1);
+                data1   = tvb_get_guint8(tvb, offset+2);
+                data2   = tvb_get_guint8(tvb, offset+3);
+
+                status_str = val_to_str_ext_const(status, &MIDI_status_ext, "Unknown");
+
+                if(status == MIDI_STATUS_CONTROLLER) /* MIDI Controller */
                 {
-                    for(cd = midi_control_dict; cd->id != NULL; cd++)
-                        if(cd->control == data1)
-                            break;
+                    const gchar *control_str;
+                    control_str = val_to_str_ext_const(data1, &MIDI_control_ext, "Unknown");
 
                     mi = proto_tree_add_none_format(message_tree, hf_osc_message_midi_type, tvb, offset, 4,
-                            "MIDI   : Channel %2i, %s (0x%02X), %s (0x%02X), 0x%02X",
+                            "MIDI: Channel %2i, %s (0x%02x), %s (0x%02x), 0x%02x",
                             channel,
-                            sd->id, status,
-                            cd->id, data1,
+                            status_str, status,
+                            control_str, data1,
                             data2);
                 }
                 else
+                {
                     mi = proto_tree_add_none_format(message_tree, hf_osc_message_midi_type, tvb, offset, 4,
-                            "MIDI   : Channel %2i, %s (0x%02X), 0x%02X, 0x%02X",
+                            "MIDI: Channel %2i, %s (0x%02x), 0x%02x, 0x%02x",
                             channel,
-                            sd->id, status,
+                            status_str, status,
                             data1, data2);
+                }
                 midi_tree = proto_item_add_subtree(mi, ett_osc_midi);
 
                 proto_tree_add_item(midi_tree, hf_osc_message_midi_channel_type, tvb, offset, 1, ENC_BIG_ENDIAN);
                 offset += 1;
 
-                if(sd && sd->id)
-                    proto_tree_add_uint_format_value(midi_tree, hf_osc_message_midi_status_type, tvb, offset, 1, status, "%s (0x%02X)", sd->id, status);
-                else
-                    proto_tree_add_item(midi_tree, hf_osc_message_midi_status_type, tvb, offset, 1, ENC_BIG_ENDIAN);
+                proto_tree_add_item(midi_tree, hf_osc_message_midi_status_type, tvb, offset, 1, ENC_BIG_ENDIAN);
                 offset += 1;
 
-                if(cd && cd->id)
-                    proto_tree_add_uint_format_value(midi_tree, hf_osc_message_midi_data1_type, tvb, offset, 1, data1, "%s (0x%02X)", cd->id, data1);
+                if(status == MIDI_STATUS_CONTROLLER)
+                {
+                    proto_tree_add_item(midi_tree, hf_osc_message_midi_controller_type, tvb, offset, 1, ENC_BIG_ENDIAN);
+                    offset += 1;
+
+                    proto_tree_add_item(midi_tree, hf_osc_message_midi_value_type, tvb, offset, 1, ENC_BIG_ENDIAN);
+                    offset += 1;
+                }
                 else
+                {
                     proto_tree_add_item(midi_tree, hf_osc_message_midi_data1_type, tvb, offset, 1, ENC_BIG_ENDIAN);
-                offset += 1;
+                    offset += 1;
 
-                proto_tree_add_item(midi_tree, hf_osc_message_midi_data2_type, tvb, offset, 1, ENC_BIG_ENDIAN);
-                offset += 1;
+                    proto_tree_add_item(midi_tree, hf_osc_message_midi_data2_type, tvb, offset, 1, ENC_BIG_ENDIAN);
+                    offset += 1;
+                }
+
                 break;
             }
 
             default:
                 /* if we get here, there must be a bug in the dissector  */
-                DISSECTOR_ASSERT(0);
+                DISSECTOR_ASSERT_NOT_REACHED();
                 break;
         }
         ptr++;
@@ -601,27 +514,28 @@ dissect_osc_message(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint of
 static int
 dissect_osc_bundle(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint offset, gint len)
 {
-    const gchar *str;
-    proto_tree *bundle_tree = NULL;
-    gint end = offset + len;
+    proto_tree  *bundle_tree;
+    gint         end = offset + len;
+    guint32      sec;
+    guint32      frac;
+    nstime_t     ns;
 
     /* check for valid #bundle */
-    str = tvb_get_const_stringz(tvb, offset, NULL);
-    if(strncmp(str, bundle_str, 8)) /* no OSC bundle */
+    if(tvb_strneql(tvb, offset, bundle_str, 8) != 0)
         return -1;
 
     /* create bundle */
-    ti = proto_tree_add_item(osc_tree, hf_osc_bundle_type, tvb, offset, len, ENC_BIG_ENDIAN);
+    ti = proto_tree_add_item(osc_tree, hf_osc_bundle_type, tvb, offset, len, ENC_NA);
+
     bundle_tree = proto_item_add_subtree(ti, ett_osc_bundle);
 
     offset += 8; /* skip bundle_str */
 
     /* read timetag */
-    guint32 sec = tvb_get_ntohl(tvb, offset);
-    guint32 frac = tvb_get_ntohl(tvb, offset+4);
-    nstime_t ns;
-    if( (sec == 0UL) && (frac == 1UL) )
-        proto_tree_add_time_format_value(bundle_tree, hf_osc_bundle_timetag_type, tvb, offset, 8, &ns, immediate_str);
+    sec  = tvb_get_ntohl(tvb, offset);
+    frac = tvb_get_ntohl(tvb, offset+4);
+    if( (sec == 0) && (frac == 1) )
+        proto_tree_add_time_format_value(bundle_tree, hf_osc_bundle_timetag_type, tvb, offset, 8, &ns, immediate_fmt, immediate_str);
     else
         proto_tree_add_item(bundle_tree, hf_osc_bundle_timetag_type, tvb, offset, 8, ENC_TIME_NTP | ENC_BIG_ENDIAN);
     offset += 8;
@@ -656,7 +570,12 @@ dissect_osc_bundle(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint off
             default:
                 return -1; /* neither message nor bundle */
         }
-        offset += size;
+
+        /* check for integer overflow */
+        if(size > G_MAXINT - offset)
+            return -1;
+        else
+            offset += size;
     }
 
     if(offset != end)
@@ -665,26 +584,21 @@ dissect_osc_bundle(tvbuff_t *tvb, proto_item *ti, proto_tree *osc_tree, gint off
         return 0;
 }
 
-/* Dissect OSC packet */
+/* Dissect OSC PDU */
 static void
-dissect_osc(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree)
+dissect_osc_pdu_common(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_, gint offset, gint len)
 {
-    gint offset = 0;
-
     col_set_str(pinfo->cinfo, COL_PROTOCOL, "OSC");
-    /* clear out stuff in the info column */
     col_clear(pinfo->cinfo, COL_INFO);
 
     if(tree) /* we are being asked for details */
     {
-        gint len;
-        proto_item *ti = NULL;
-        proto_tree *osc_tree = NULL;
+        proto_item *ti;
+        proto_tree *osc_tree;
 
         /* create OSC packet */
         ti = proto_tree_add_item(tree, proto_osc, tvb, 0, -1, ENC_NA);
         osc_tree = proto_item_add_subtree(ti, ett_osc_packet);
-        len = proto_item_get_len(ti);
 
         /* peek first bundle element char */
         switch(tvb_get_guint8(tvb, offset))
@@ -705,33 +619,89 @@ dissect_osc(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree)
     }
 }
 
-/* OSC heuristics */
-static gboolean
-dissect_osc_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
+/* OSC TCP */
+
+static guint
+get_osc_pdu_len(packet_info *pinfo _U_, tvbuff_t *tvb, int offset)
 {
-    gint offset = 0;
-    gint slen;
-    gint rem;
-    const gchar *str = NULL;
-    conversation_t *conversation = NULL;
+    return tvb_get_ntohl(tvb, offset) + 4;
+}
+
+static int
+dissect_osc_tcp_pdu(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+    gint pdu_len;
+
+    pdu_len = tvb_get_ntohl(tvb, 0);
+    dissect_osc_pdu_common(tvb, pinfo, tree, data, 4, pdu_len);
+    return pdu_len;
+}
+
+static int
+dissect_osc_tcp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+    tcp_dissect_pdus(tvb, pinfo, tree, TRUE, 4, get_osc_pdu_len,
+                     dissect_osc_tcp_pdu, data);
+    return tvb_reported_length(tvb);
+}
+
+/* OSC UDP */
+
+static int
+dissect_osc_udp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+    gint pdu_len;
+
+    pdu_len = tvb_reported_length(tvb);
+    dissect_osc_pdu_common(tvb,pinfo, tree, data, 0, pdu_len);
+    return pdu_len;
+}
+
+/* UDP Heuristic */
+static gboolean
+dissect_osc_heur_udp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+    conversation_t *conversation;
+
+		/*
+    if(tvb_captured_length(tvb) < 8)
+        return FALSE;
+		*/
 
     /* peek first string */
-    str = tvb_get_const_stringz(tvb, offset, &slen);
-    if(strncmp(str, bundle_str, 8) != 0) /* no OSC bundle */
+    if(tvb_strneql(tvb, 0, bundle_str, 8) != 0) /* no OSC bundle */
     {
-        /* check for valid path */
-        if(!is_valid_path(str))
-            return FALSE;
+        gint         offset = 0;
+        gint         slen;
+        gint         rem;
+        const gchar *str;
+        gboolean     valid  = FALSE;
 
-        /* skip path */
-        if( (rem = slen%4) ) slen += 4-rem;
-        offset += slen;
+        /* Check for valid path */
+        /* Don't propagate any exceptions upwards during heuristics check  */
+        /* XXX: this check is a bit expensive; Consider: use UDP port pref ? */
+        TRY {
+            str = tvb_get_const_stringz(tvb, offset, &slen);
+            if(is_valid_path(str)) {
 
-        /* peek next string */
-        str = tvb_get_const_stringz(tvb, offset, &slen);
+                /* skip path */
+                if( (rem = slen%4) ) slen += 4-rem;
+                offset += slen;
 
-        /* check for valid format */
-        if(!is_valid_format(str))
+                /* peek next string */
+                str = tvb_get_const_stringz(tvb, offset, &slen);
+
+                /* check for valid format */
+                if(is_valid_format(str))
+                    valid = TRUE;
+            }
+        }
+        CATCH_ALL {
+            valid = FALSE;
+        }
+        ENDTRY;
+
+        if(! valid)
             return FALSE;
     }
 
@@ -739,10 +709,10 @@ dissect_osc_heur(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data
 
     /* specify that dissect_osc is to be called directly from now on for packets for this connection */
     conversation = find_or_create_conversation(pinfo);
-    conversation_set_dissector(conversation, osc_handle);
+    conversation_set_dissector(conversation, osc_udp_handle);
 
     /* do the dissection */
-    dissect_osc(tvb, pinfo, tree);
+    dissect_osc_udp(tvb, pinfo, tree, data);
 
     return TRUE; /* OSC heuristics was matched */
 }
@@ -752,16 +722,16 @@ void
 proto_register_osc(void)
 {
     static hf_register_info hf[] = {
-        { &hf_osc_bundle_type, { "Bundle ", "osc.bundle",
+        { &hf_osc_bundle_type, { "Bundle", "osc.bundle",
                 FT_NONE, BASE_NONE,
                 NULL, 0x0,
-                "Bundle", HFILL } },
+                "Bundle structure", HFILL } },
         { &hf_osc_bundle_timetag_type, { "Timetag", "osc.bundle.timetag",
                 FT_ABSOLUTE_TIME, ABSOLUTE_TIME_UTC,
                 NULL, 0x0,
                 "Scheduled bundle execution time", HFILL } },
 
-        { &hf_osc_bundle_element_size_type, { "Size   ", "osc.bundle.element.size",
+        { &hf_osc_bundle_element_size_type, { "Size", "osc.bundle.element.size",
                 FT_INT32, BASE_DEC,
                 NULL, 0x0,
                 "Bundle element size", HFILL } },
@@ -769,12 +739,12 @@ proto_register_osc(void)
         { &hf_osc_message_type, { "Message", "osc.message",
                 FT_NONE, BASE_NONE,
                 NULL, 0x0,
-                "Message", HFILL } },
-        { &hf_osc_message_header_type, { "Header ", "osc.message.header",
+                "Message structure", HFILL } },
+        { &hf_osc_message_header_type, { "Header", "osc.message.header",
                 FT_NONE, BASE_NONE,
                 NULL, 0x0,
                 "Message header", HFILL } },
-        { &hf_osc_message_path_type, { "Path  ", "osc.message.header.path",
+        { &hf_osc_message_path_type, { "Path", "osc.message.header.path",
                 FT_STRING, BASE_NONE,
                 NULL, 0x0,
                 "Message path", HFILL } },
@@ -783,20 +753,20 @@ proto_register_osc(void)
                 NULL, 0x0,
                 "Message format", HFILL } },
 
-        { &hf_osc_message_int32_type, { "Int32  ", "osc.message.int32",
+        { &hf_osc_message_int32_type, { "Int32", "osc.message.int32",
                 FT_INT32, BASE_DEC,
                 NULL, 0x0,
                 "32bit integer value", HFILL } },
-        { &hf_osc_message_float_type, { "Float  ", "osc.message.float",
+        { &hf_osc_message_float_type, { "Float", "osc.message.float",
                 FT_FLOAT, BASE_NONE,
                 NULL, 0x0,
                 "Floating point value", HFILL } },
-        { &hf_osc_message_string_type, { "String ", "osc.message.string",
+        { &hf_osc_message_string_type, { "String", "osc.message.string",
                 FT_STRING, BASE_NONE,
                 NULL, 0x0,
                 "String value", HFILL } },
 
-        { &hf_osc_message_blob_type, { "Blob   ", "osc.message.blob",
+        { &hf_osc_message_blob_type, { "Blob", "osc.message.blob",
                 FT_NONE, BASE_NONE,
                 NULL, 0x0,
                 "Binary blob value", HFILL } },
@@ -809,28 +779,28 @@ proto_register_osc(void)
                 NULL, 0x0,
                 "Binary blob data", HFILL } },
 
-        { &hf_osc_message_true_type, { "True   ", "osc.message.true",
+        { &hf_osc_message_true_type, { "True", "osc.message.true",
                 FT_NONE, BASE_NONE,
                 NULL, 0x0,
                 "Boolean true value", HFILL } },
-        { &hf_osc_message_false_type, { "False  ", "osc.message.false",
+        { &hf_osc_message_false_type, { "False", "osc.message.false",
                 FT_NONE, BASE_NONE,
                 NULL, 0x0,
                 "Boolean false value", HFILL } },
-        { &hf_osc_message_nil_type, { "Nil    ", "osc.message.nil",
+        { &hf_osc_message_nil_type, { "Nil", "osc.message.nil",
                 FT_NONE, BASE_NONE,
                 NULL, 0x0,
                 "Nil value", HFILL } },
-        { &hf_osc_message_bang_type, { "Bang   ", "osc.message.bang",
+        { &hf_osc_message_bang_type, { "Bang", "osc.message.bang",
                 FT_NONE, BASE_NONE,
                 NULL, 0x0,
                 "Infinity, Impulse or Bang value", HFILL } },
 
-        { &hf_osc_message_int64_type, { "Int64  ", "osc.message.int64",
+        { &hf_osc_message_int64_type, { "Int64", "osc.message.int64",
                 FT_INT64, BASE_DEC,
                 NULL, 0x0,
                 "64bit integer value", HFILL } },
-        { &hf_osc_message_double_type, { "Double ", "osc.message.double",
+        { &hf_osc_message_double_type, { "Double", "osc.message.double",
                 FT_DOUBLE, BASE_NONE,
                 NULL, 0x0,
                 "Double value", HFILL } },
@@ -839,20 +809,20 @@ proto_register_osc(void)
                 NULL, 0x0,
                 "NTP time value", HFILL } },
 
-        { &hf_osc_message_symbol_type, { "Symbol ", "osc.message.symbol",
+        { &hf_osc_message_symbol_type, { "Symbol", "osc.message.symbol",
                 FT_STRING, BASE_NONE,
                 NULL, 0x0,
                 "Symbol value", HFILL } },
-        { &hf_osc_message_char_type, { "Char   ", "osc.message.char",
+        { &hf_osc_message_char_type, { "Char", "osc.message.char",
                 FT_STRING, BASE_NONE,
                 NULL, 0x0,
                 "Character value", HFILL } },
 
-        { &hf_osc_message_rgba_type, { "RGBA   ", "osc.message.rgba",
+        { &hf_osc_message_rgba_type, { "RGBA", "osc.message.rgba",
                 FT_UINT32, BASE_HEX,
                 NULL, 0x0,
                 "RGBA color value", HFILL } },
-        { &hf_osc_message_rgba_red_type, { "Red  ", "osc.message.rgba.red",
+        { &hf_osc_message_rgba_red_type, { "Red", "osc.message.rgba.red",
                 FT_UINT8, BASE_DEC,
                 NULL, 0x0,
                 "Red color component", HFILL } },
@@ -860,7 +830,7 @@ proto_register_osc(void)
                 FT_UINT8, BASE_DEC,
                 NULL, 0x0,
                 "Green color component", HFILL } },
-        { &hf_osc_message_rgba_blue_type, { "Blue ", "osc.message.rgba.blue",
+        { &hf_osc_message_rgba_blue_type, { "Blue", "osc.message.rgba.blue",
                 FT_UINT8, BASE_DEC,
                 NULL, 0x0,
                 "Blue color component", HFILL } },
@@ -869,7 +839,7 @@ proto_register_osc(void)
                 NULL, 0x0,
                 "Alpha transparency component", HFILL } },
 
-        { &hf_osc_message_midi_type, { "MIDI   ", "osc.message.midi",
+        { &hf_osc_message_midi_type, { "MIDI", "osc.message.midi",
                 FT_NONE, BASE_NONE,
                 NULL, 0x0,
                 "MIDI value", HFILL } },
@@ -877,18 +847,26 @@ proto_register_osc(void)
                 FT_UINT8, BASE_DEC,
                 NULL, 0x0,
                 "MIDI channel", HFILL } },
-        { &hf_osc_message_midi_status_type, { "Status ", "osc.message.midi.status",
-                FT_UINT8, BASE_HEX,
-                NULL, 0x0,
+        { &hf_osc_message_midi_status_type, { "Status", "osc.message.midi.status",
+                FT_UINT8, BASE_HEX | BASE_EXT_STRING,
+                &MIDI_status_ext, 0x0,
                 "MIDI status message", HFILL } },
-        { &hf_osc_message_midi_data1_type, { "Data1  ", "osc.message.midi.data1",
+        { &hf_osc_message_midi_data1_type, { "Data1", "osc.message.midi.data1",
                 FT_UINT8, BASE_HEX,
                 NULL, 0x0,
                 "MIDI data value 1", HFILL } },
-        { &hf_osc_message_midi_data2_type, { "Data2  ", "osc.message.midi.data2",
+        { &hf_osc_message_midi_data2_type, { "Data2", "osc.message.midi.data2",
                 FT_UINT8, BASE_HEX,
                 NULL, 0x0,
-                "MIDI data value 2", HFILL } }
+                "MIDI data value 2", HFILL } },
+        { &hf_osc_message_midi_controller_type, { "Controller", "osc.message.midi.controller",
+                FT_UINT8, BASE_HEX | BASE_EXT_STRING,
+                &MIDI_control_ext, 0x0,
+                "MIDI controller message", HFILL } },
+        { &hf_osc_message_midi_value_type, { "Value", "osc.message.midi.value",
+                FT_UINT8, BASE_HEX,
+                NULL, 0x0,
+                "MIDI controller value", HFILL } }
     };
 
     /* Setup protocol subtree array */
@@ -902,21 +880,64 @@ proto_register_osc(void)
         &ett_osc_midi
     };
 
+    module_t *osc_module;
+
     proto_osc = proto_register_protocol("Open Sound Control Protocol", "OSC", "osc");
 
     proto_register_field_array(proto_osc, hf, array_length(hf));
     proto_register_subtree_array(ett, array_length(ett));
+
+    osc_module = prefs_register_protocol(proto_osc, proto_reg_handoff_osc);
+
+    prefs_register_uint_preference(osc_module, "tcp.port",
+                                   "OSC TCP Port",
+                                   "Set the TCP port for OSC",
+                                   10, &global_osc_tcp_port);
 }
 
 void
 proto_reg_handoff_osc(void)
 {
-    osc_handle = create_dissector_handle(dissect_osc, proto_osc);
+    static dissector_handle_t osc_tcp_handle;
+    static guint              osc_tcp_port;
+    static gboolean           initialized = FALSE;
 
-    /* register as heuristic dissector for TCP and UDP connections */
-    heur_dissector_add("tcp", dissect_osc_heur, proto_osc);
-    heur_dissector_add("udp", dissect_osc_heur, proto_osc);
+    if(! initialized)
+    {
+        osc_tcp_handle = new_create_dissector_handle(dissect_osc_tcp, proto_osc);
+        dissector_add_handle("tcp.port", osc_tcp_handle); /* for "decode-as" */
+
+        /* XXX: Add port pref and  "decode as" for UDP ? */
+        /*      (The UDP heuristic is a bit expensive    */
+        osc_udp_handle = new_create_dissector_handle(dissect_osc_udp, proto_osc);
+        /* register as heuristic dissector for UDP connections */
+        heur_dissector_add("udp", dissect_osc_heur_udp, proto_osc);
+
+        initialized = TRUE;
+    }
+    else
+    {
+        if(osc_tcp_port != 0)
+            dissector_delete_uint("tcp.port", osc_tcp_port, osc_tcp_handle);
+    }
+
+    osc_tcp_port = global_osc_tcp_port;
+    if(osc_tcp_port != 0)
+        dissector_add_uint("tcp.port", osc_tcp_port, osc_tcp_handle);
 }
+
+/*
+ * Editor modelines  -  http://www.wireshark.org/tools/modelines.html
+ *
+ * Local variables:
+ * c-basic-offset: 4
+ * tab-width: 8
+ * indent-tabs-mode: nil
+ * End:
+ *
+ * vi: set shiftwidth=4 tabstop=8 expandtab:
+ * :indentSize=4:tabSize=8:noTabs=true:
+ */
 
 #define AS_PLUGIN
 #ifdef AS_PLUGIN
@@ -934,16 +955,3 @@ plugin_reg_handoff(void)
     proto_reg_handoff_osc();
 }
 #endif
-
-/*
- * Editor modelines  -  http://www.wireshark.org/tools/modelines.html
- *
- * Local variables:
- * c-basic-offset: 4
- * tab-width: 8
- * indent-tabs-mode: nil
- * End:
- *
- * vi: set shiftwidth=4 tabstop=8 expandtab:
- * :indentSize=4:tabSize=8:noTabs=true:
- */
